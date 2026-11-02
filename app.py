@@ -1,12 +1,12 @@
 import streamlit as st
 from pypdf import PdfReader
+from pypdf.mult import mult
 import re
 import base64
 from collections import defaultdict
 
 st.set_page_config(page_title="IEEE SA Draft MEC Pre-Check", layout="wide")
 
-# --- Rules and Dictionaries ---
 MODAL_VERBS = {
     "shall": r"\bshall\b", "shall not": r"\bshall not\b",
     "should": r"\bshould\b", "should not": r"\bshould not\b",
@@ -36,7 +36,8 @@ class DraftAuditor:
     def __init__(self, file_obj):
         self.reader = PdfReader(file_obj)
         self.total_pages = len(self.reader.pages)
-        self.pages_text = {idx + 1: (page.extract_text() or "") for idx, page in enumerate(self.reader.pages)}
+        self.pages_text = {}
+        self.pages_margin_numbers = defaultdict(list)
         self.modal_counts = defaultdict(int)
         self.modal_occurrences = defaultdict(list)
         self.issues = []
@@ -46,11 +47,37 @@ class DraftAuditor:
         self.copyright_found = False
 
     def run_audit(self):
+        self._extract_with_coordinates()
         self._check_modal_verbs()
         self._check_discouraged_and_vague()
         self._check_commercial_symbols()
         self._check_mandatory_clauses()
         self._check_mechanics()
+
+    def _extract_with_coordinates(self):
+        for idx, page in enumerate(self.reader.pages):
+            page_num = idx + 1
+            raw_text = page.extract_text() or ""
+            self.pages_text[page_num] = raw_text
+
+            # Coordinate visitor: capture text rendered in the left margin (X <= 85 pt)
+            margin_tokens = []
+            def visitor_margin(text, cm, tm, font_dict, font_size):
+                if text and text.strip().isdigit():
+                    try:
+                        x = mult(tm, cm)[4]
+                        # Standard left margin for Word line numbers is between 15 pt and 85 pt
+                        if 10 <= x <= 90:
+                            margin_tokens.append(int(text.strip()))
+                    except Exception:
+                        pass
+
+            try:
+                page.extract_text(visitor_text=visitor_margin)
+                if margin_tokens:
+                    self.pages_margin_numbers[page_num] = sorted(margin_tokens)
+            except Exception:
+                pass
 
     def _check_modal_verbs(self):
         for page_num, text in self.pages_text.items():
@@ -87,51 +114,42 @@ class DraftAuditor:
 
     def _check_mechanics(self):
         for page_num, text in self.pages_text.items():
-            is_page_numbered = False
-            
-            # Strategy A: Check for consecutive numbers (e.g. 1, 2, 3, 4, 5...)
-            tokens = re.findall(r'\b([1-9]|[1-4][0-9])\b', text)
-            int_tokens = [int(t) for t in tokens]
-            max_consecutive = 0
-            curr = 1
-            for i in range(1, len(int_tokens)):
-                if int_tokens[i] == int_tokens[i-1] + 1:
-                    curr += 1
-                    if curr > max_consecutive:
-                        max_consecutive = curr
-                elif int_tokens[i] == int_tokens[i-1]:
-                    continue
-                else:
-                    curr = 1
-            if max_consecutive >= 4:
-                is_page_numbered = True
+            is_numbered = False
 
-            # Strategy B: Check lines starting with digits (1-50)
-            if not is_page_numbered:
+            # Check 1: Physical margin coordinate detection (most accurate for Word exports)
+            margin_nums = self.pages_margin_numbers.get(page_num, [])
+            if len(margin_nums) >= 4:
+                is_numbered = True
+
+            # Check 2: Text stream fallback (if digits 1 to 5 appear as isolated tokens)
+            if not is_numbered:
+                tokens = [int(t) for t in re.findall(r'\b([1-9]|[1-4][0-9])\b', text)]
+                # Look for a presence of small sequential numbers
+                found_initial = sum(1 for n in [1, 2, 3, 4, 5] if n in tokens)
+                if found_initial >= 4 and len(tokens) >= 10:
+                    is_numbered = True
+
+            # Check 3: Newline-separated digit sequences
+            if not is_numbered:
                 lines = [l.strip() for l in text.splitlines() if l.strip()]
                 line_starts = sum(1 for l in lines if re.match(r'^(?:[1-9]|[1-4][0-9])\b', l))
                 if line_starts >= 4:
-                    is_page_numbered = True
+                    is_numbered = True
 
-            # Strategy C: Check space-separated margin sequences
-            if not is_page_numbered and re.search(r'\b1\s+2\s+3\s+4\b', text):
-                is_page_numbered = True
-
-            if is_page_numbered:
+            if is_numbered:
                 self.numbered_pages_list.append(page_num)
 
-            # Check Copyright Notice
             if re.search(r"Copyright\s+(?:©|\(c\))\s+\d{4}\s+IEEE", text, flags=re.IGNORECASE):
                 self.copyright_found = True
 
-        # If at least 3 body pages have verified sequential line numbers, standard passes
-        if len(self.numbered_pages_list) >= 3:
+        # At least 2 body pages with verified line numbering qualifies the draft
+        if len(self.numbered_pages_list) >= 2:
             self.has_continuous_lines = True
 
 
-# --- GUI Application ---
+# --- Streamlit UI ---
 st.title("📄 IEEE SA Draft MEC Audit Pre-Check")
-st.markdown("Upload a draft standard PDF to check for line numbers, mandatory clauses, standards verbs, and editorial flags.")
+st.markdown("Auditing draft PDFs for line numbers, mandatory clauses, standards verbs, and editorial flags.")
 
 uploaded_file = st.file_uploader("Upload IEEE Draft PDF", type="pdf")
 
@@ -143,13 +161,12 @@ if uploaded_file is not None:
         file_bytes = uploaded_file.getvalue()
         base64_pdf = base64.b64encode(file_bytes).decode('utf-8')
         
-        # Object tag with embedded fallback for Chromium / Edge sandboxing
         pdf_display = f'''
             <object data="data:application/pdf;base64,{base64_pdf}" type="application/pdf" width="100%" height="800px">
                 <div style="padding: 20px; border: 1px solid #ddd; border-radius: 5px;">
-                    <p>Your browser blocked the inline preview of this 2.5MB file.</p>
+                    <p>Preview blocked by browser security.</p>
                     <a href="data:application/pdf;base64,{base64_pdf}" download="{uploaded_file.name}">
-                        Click here to download / open PDF locally
+                        Click here to download PDF
                     </a>
                 </div>
             </object>
@@ -174,7 +191,7 @@ if uploaded_file is not None:
         st.markdown("### 2. Document Mechanics")
         if auditor.has_continuous_lines:
             sample_pgs = str(auditor.numbered_pages_list[:8]) + ("..." if len(auditor.numbered_pages_list) > 8 else "")
-            st.success(f"✅ Line Numbers Detected across {len(auditor.numbered_pages_list)} pages (e.g. Pages {sample_pgs})")
+            st.success(f"✅ Line Numbers Detected across {len(auditor.numbered_pages_list)} pages (Pages: {sample_pgs})")
         else:
             st.error("❌ Missing Line Numbers (MEC FAIL)")
             
